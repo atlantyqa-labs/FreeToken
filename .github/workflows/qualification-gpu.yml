@@ -1,0 +1,50 @@
+name: Qualification Wave 0 GPU
+on:
+  workflow_dispatch:
+    inputs:
+      model:
+        description: Exact Hugging Face model id
+        required: true
+        type: choice
+        options: [Qwen/Qwen3.6-35B-A3B, openai/gpt-oss-20b, openai/gpt-oss-120b]
+      gpu:
+        description: nvidia-smi GPU UUID or index
+        required: true
+        default: "0"
+permissions:
+  contents: read
+  id-token: write
+jobs:
+  qualify:
+    runs-on: [self-hosted, linux, x64, gpu, freetoken-qualification]
+    timeout-minutes: 720
+    steps:
+      - uses: actions/checkout@v4
+        with: {fetch-depth: 0}
+      - name: Assert frozen upstream lineage
+        run: |
+          git merge-base --is-ancestor 2757bb5f91156fc8a44d88ec4b302a81f10c9e81 HEAD
+          test "$(jq -r .commit qualification/upstream.lock.json)" = "2757bb5f91156fc8a44d88ec4b302a81f10c9e81"
+      - name: Build isolated runtime
+        run: docker build --pull -f Dockerfile.qualification -t freetoken-qualification:${{ github.sha }} .
+      - name: Generate SBOM
+        run: mkdir -p qualification/out && syft freetoken-qualification:${{ github.sha }} -o cyclonedx-json=qualification/out/sbom.cdx.json
+      - name: Generate source provenance
+        run: cosign attest-blob --yes --predicate qualification/upstream.lock.json --type slsaprovenance --bundle qualification/out/provenance.intoto.jsonl qualification/upstream.lock.json
+      - name: Execute qualification
+        env:
+          MODEL: ${{ inputs.model }}
+          GPU: ${{ inputs.gpu }}
+          ALLOW_QUALIFICATION_COMMITS: "1"
+        run: |
+          docker run --rm --gpus "device=$GPU" --network host -e MODEL -e GPU -e ALLOW_QUALIFICATION_COMMITS -v "$PWD/qualification:/src/qualification" -v "$HOME/.cache:/root/.cache" --entrypoint bash freetoken-qualification:${{ github.sha }} /src/qualification/run.sh
+      - name: Validate evidence
+        if: always()
+        run: python3 -m pip install jsonschema && python3 -m jsonschema -i qualification/out/FreeTokenRuntimeEvidence.json qualification/evidence.schema.json
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: FreeTokenRuntimeEvidence-${{ inputs.model }}-${{ github.run_id }}
+          path: qualification/out/
+          if-no-files-found: error
+          retention-days: 90
