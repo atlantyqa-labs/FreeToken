@@ -1,0 +1,66 @@
+name: Qualification Wave 0 Run All
+on:
+  push:
+    branches: [qualification/run-all-20260825]
+permissions:
+  contents: read
+  id-token: write
+concurrency:
+  group: freetoken-qualification-wave-0
+  cancel-in-progress: false
+jobs:
+  qualify:
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix:
+        model:
+          - Qwen/Qwen3.6-35B-A3B
+          - openai/gpt-oss-20b
+          - openai/gpt-oss-120b
+    runs-on: [self-hosted, linux, x64]
+    timeout-minutes: 720
+    steps:
+      - uses: actions/checkout@v4
+        with: {fetch-depth: 0}
+      - name: Bare-metal NVIDIA preflight
+        run: |
+          set -Eeuo pipefail
+          nvidia-smi
+          docker version
+          docker info | grep -i -E 'nvidia|runtimes' || true
+          df -h
+          free -h
+          command -v syft
+          command -v cosign
+          command -v jq
+      - name: Assert frozen upstream lineage
+        run: |
+          git merge-base --is-ancestor 2757bb5f91156fc8a44d88ec4b302a81f10c9e81 HEAD
+          test "$(jq -r .commit qualification/upstream.lock.json)" = "2757bb5f91156fc8a44d88ec4b302a81f10c9e81"
+      - name: Build isolated runtime
+        run: docker build --pull -f Dockerfile.qualification -t freetoken-qualification:${{ github.sha }} .
+      - name: Generate SBOM
+        run: mkdir -p qualification/out && syft freetoken-qualification:${{ github.sha }} -o cyclonedx-json=qualification/out/sbom.cdx.json
+      - name: Generate provenance
+        run: cosign attest-blob --yes --predicate qualification/upstream.lock.json --type slsaprovenance --bundle qualification/out/provenance.intoto.jsonl qualification/upstream.lock.json
+      - name: Execute qualification
+        env:
+          MODEL: ${{ matrix.model }}
+          GPU: "0"
+          ALLOW_QUALIFICATION_COMMITS: "1"
+        run: |
+          docker run --rm --gpus "device=$GPU" --network host -e MODEL -e GPU -e ALLOW_QUALIFICATION_COMMITS -v "$PWD/qualification:/src/qualification" -v "$HOME/.cache:/root/.cache" --entrypoint bash freetoken-qualification:${{ github.sha }} /src/qualification/run.sh
+      - name: Validate evidence
+        if: always()
+        run: python3 -m pip install jsonschema && python3 -m jsonschema -i qualification/out/FreeTokenRuntimeEvidence.json qualification/evidence.schema.json
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: FreeTokenRuntimeEvidence-${{ strategy.job-index }}-${{ github.run_id }}
+          path: qualification/out/
+          if-no-files-found: warn
+          retention-days: 90
+      - name: Clean model-specific evidence
+        if: always()
+        run: rm -rf qualification/out
